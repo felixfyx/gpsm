@@ -1,0 +1,1 @@
+MAX_BUFFER_SIZE = 64
