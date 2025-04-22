@@ -3,7 +3,6 @@ import serial.tools.list_ports
 import time
 import threading
 import Globals
-import Utils
 from enum import Enum
 
 class ConnectionStatus(Enum):
@@ -204,7 +203,7 @@ class SerialMessageHandler:
             
         # Validate checksum
         received_checksum = self.buffer[length - 1]
-        calculated_checksum = Utils.calculate_checksum(self.buffer[:length - 1])
+        calculated_checksum = self.calculate_checksum(self.buffer[:length - 1])
         
         if received_checksum == calculated_checksum:
             command_id = bytes([self.buffer[2]])
@@ -322,10 +321,14 @@ class SerialMessageHandler:
         self.log(f"Associated with device: {device_name}")
 
 
-# Handshake response handler
+# Handshake command handler
 def send_handshake_response(handler, payload):
     """
-    Process handshake responses from devices
+    Process handshake responses from devices according to the protocol:
+    1. PC sends 0xFF with payload 0x00
+    2. Arduino responds with 0xFF and its device ID
+    3. PC responds with 0xFF and echoes back the device ID it received
+    4. Arduino responds with 0xFF and payload 0xAA for success or 0xFF for failure
     """
     handler.log(f"Processing handshake response with payload: {[hex(b) for b in payload]}")
     
@@ -333,41 +336,59 @@ def send_handshake_response(handler, payload):
         handler.log("Invalid handshake payload length")
         return
         
-    body = payload[0]
+    received_value = payload[0]
+    handler.log(f"Received value: {hex(received_value)}")
     
-    # First phase - device identification
+    # Phase 2: Arduino responded with its device ID
+    if received_value in [device_info["id"] for device_name, device_info in io_devices.items()]:
+        # Find which device this ID belongs to
+        for device_name, device_info in io_devices.items():
+            if received_value == device_info["id"]:
+                handler.log(f"Identified device: {device_name} with ID: {hex(received_value)}")
+                
+                # Update device status to in-progress
+                device_info["connection_status"] = ConnectionStatus.IN_PROGRESS
+                device_info["port_number"] = handler.port
+                device_info["thread"] = handler.thread
+                device_info["handler"] = handler
+                
+                # Associate this handler with the device
+                handler.set_device(device_name, device_info)
+                
+                # Phase 3: Echo back the device ID
+                handler.log(f"Sending back device ID: {hex(received_value)}")
+                handler.send_data(bytes([0xFF]), bytes([received_value]))
+                return
+    
+    # Phase 4: Arduino responded with success/failure
+    elif received_value == 0xAA:
+        # Success confirmation
+        handler.log("Received successful handshake confirmation (0xAA)")
+        if handler.device_name != "NULL":
+            device_info = io_devices[handler.device_name]
+            if device_info["connection_status"] == ConnectionStatus.IN_PROGRESS:
+                device_info["connection_status"] = ConnectionStatus.CONNECTED
+                handler.log(f"Handshake complete for {handler.device_name}!")
+                return
+            else:
+                handler.log(f"Device {handler.device_name} not in progress state (state: {device_info['connection_status']})")
+        else:
+            handler.log("Received handshake confirmation but no device is associated with this handler")
+    
+    elif received_value == 0xFF:
+        # Error confirmation
+        handler.log("Received error handshake response (0xFF)")
+        if handler.device_name != "NULL":
+            device_info = io_devices[handler.device_name]
+            if device_info["connection_status"] == ConnectionStatus.IN_PROGRESS:
+                device_info["connection_status"] = ConnectionStatus.NOT_CONNECTED
+                handler.log(f"Handshake failed for {handler.device_name}!")
+                return
+    
+    handler.log(f"Unhandled handshake response: {hex(received_value)}")
+    handler.log(f"Current handler device: {handler.device_name}")
     for device_name, device_info in io_devices.items():
-        # Skip already connected devices
-        if device_info["connection_status"] == ConnectionStatus.CONNECTED:
-            continue
-            
-        # Check if this is a device ID we recognize
-        if body == device_info["id"]:
-            handler.log(f"Identified device: {device_name}")
-            
-            # Update device status to in-progress
-            device_info["connection_status"] = ConnectionStatus.IN_PROGRESS
-            device_info["port_number"] = handler.port
-            device_info["thread"] = handler.thread
-            device_info["handler"] = handler
-            
-            # Associate this handler with the device
-            handler.set_device(device_name, device_info)
-            
-            # Send handshake confirmation
-            confirm_payload = bytes([0xAA])  # Handshake confirmation code
-            handler.send_data(bytes([0xFF]), confirm_payload)
-            return
-            
-    # Second phase - handshake confirmation (0xAA)
-    if body == 0xFF and handler.device_name != "NULL":
-        device_info = io_devices[handler.device_name]
-        if device_info["connection_status"] == ConnectionStatus.IN_PROGRESS:
-            device_info["connection_status"] = ConnectionStatus.CONNECTED
-            handler.log(f"Handshake complete for {handler.device_name}")
-            return
-            
-    handler.log(f"Unhandled handshake response: {hex(body)}")
+        handler.log(f"Device {device_name}: ID={hex(device_info['id'])}, Status={device_info['connection_status']}, Port={device_info['port_number']}")
 
 
 def discover_devices(timeout=30):
@@ -421,18 +442,44 @@ def discover_devices(timeout=30):
                 
             # Send handshake requests to all handlers
             for handler in handlers:
-                for device_name, device_info in io_devices.items():
-                    if device_info["connection_status"] == ConnectionStatus.NOT_CONNECTED:
-                        # Send handshake request with the device ID
-                        payload = bytes([device_info["id"]])
-                        handler.send_data(handshake_command_id, payload)
+                # Skip handlers that are already associated with a connected device
+                if handler.device_name != "NULL" and io_devices[handler.device_name]["connection_status"] == ConnectionStatus.CONNECTED:
+                    continue
+                    
+                # Send initial handshake request with 0x00 payload
+                handler.send_data(handshake_command_id, bytes([0x00]))
             
             # Wait before next attempt
             time.sleep(1)
             
         # Print discovery results
         print("\nDevice Discovery Results:")
-        print(f"{io_devices}")
+        for device_name, device_info in io_devices.items():
+            status = device_info["connection_status"].name
+            port = device_info["port_number"] if status != "NOT_CONNECTED" else "N/A"
+            print(f"{device_name}: {status} on {port}")
+        
+        # Close handlers for devices that weren't connected
+        for handler in handlers:
+            if handler.device_name == "NULL":
+                handler.close_connection()
+                handlers.remove(handler)
+        
+        return {name: info for name, info in io_devices.items() 
+                if info["connection_status"] == ConnectionStatus.CONNECTED}
+                
+    except Exception as e:
+        print(f"Error during device discovery: {e}")
+        # Clean up on error
+        for handler in handlers:
+            try:
+                handler.close_connection()
+            except:
+                pass
+        return {}
+            
+        # Print discovery results
+        print("\nDevice Discovery Results:")
         for device_name, device_info in io_devices.items():
             status = device_info["connection_status"].name
             port = device_info["port_number"] if status != "NOT_CONNECTED" else "N/A"
