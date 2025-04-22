@@ -3,6 +3,7 @@ import serial.tools.list_ports
 import time
 import threading
 import Globals
+import Command
 from enum import Enum
 
 class ConnectionStatus(Enum):
@@ -355,9 +356,9 @@ def send_handshake_response(handler, payload):
                 # Associate this handler with the device
                 handler.set_device(device_name, device_info)
                 
-                # Phase 3: Echo back the device ID
+                # Phase 3: Echo back the device ID using Command.py
                 handler.log(f"Sending back device ID: {hex(received_value)}")
-                handler.send_data(bytes([0xFF]), bytes([received_value]))
+                Command.send_handshake(bytes([received_value]), handler)
                 return
     
     # Phase 4: Arduino responded with success/failure
@@ -566,4 +567,5 @@ if __name__ == "__main__":
                 except Exception as e:
                     print(f"Error joining thread for {device_name}: {e}")
         
+        print(f"Final status: {io_devices}")
         print("Done!")
