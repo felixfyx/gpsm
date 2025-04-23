@@ -1,40 +1,15 @@
 import serial
-import serial.tools.list_ports
 import time
 import threading
-import Globals
-import Command
 from enum import Enum
+import Globals
+
 
 class ConnectionStatus(Enum):
     NOT_CONNECTED = 0
     CONNECTED = 1
     IN_PROGRESS = 2
 
-# Dictionary to track different connected devices
-io_devices = {
-    "gpio": {
-        "id": 0x01,
-        "connection_status": ConnectionStatus.NOT_CONNECTED,
-        "port_number": "NULL",
-        "thread": None,
-        "handler": None
-    },
-    "turret": {
-        "id": 0x02,
-        "connection_status": ConnectionStatus.NOT_CONNECTED,
-        "port_number": "NULL",
-        "thread": None,
-        "handler": None
-    },
-    "led": {
-        "id": 0x03,
-        "connection_status": ConnectionStatus.NOT_CONNECTED,
-        "port_number": "NULL",
-        "thread": None,
-        "handler": None
-    },
-}
 
 class MessageState(Enum):
     WAITING_FOR_START = 0
@@ -42,6 +17,7 @@ class MessageState(Enum):
     COLLECTING_DATA = 2
     COMPLETE = 3
     ERROR = 4
+
 
 class SerialMessageHandler:
     # Start byte that signifies the beginning of a message
@@ -65,16 +41,30 @@ class SerialMessageHandler:
         self.device = None
         self.device_name = "NULL"
         
-        # Auto-reconnect parameters
+        # Connection management
+        self.forced_disconnect = False
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
         self.reconnect_delay = 2  # seconds
         
-        # Thread management
-        self.thread_exit = threading.Event()
+        # Thread management - using simple lock-protected flag for thread control
+        self._lock = threading.Lock()
+        self._thread_running = True
         self.thread = threading.Thread(target=self.run)
         self.thread.daemon = False  # Non-daemon thread so we can join it properly
         self.thread.start()
+        
+    @property
+    def thread_running(self):
+        """Thread-safe getter for thread_running flag"""
+        with self._lock:
+            return self._thread_running
+            
+    @thread_running.setter
+    def thread_running(self, value):
+        """Thread-safe setter for thread_running flag"""
+        with self._lock:
+            self._thread_running = value
 
     def log(self, message):
         """Print debug messages if debug mode is enabled"""
@@ -83,25 +73,54 @@ class SerialMessageHandler:
 
     def run(self):
         """Main thread loop"""
-        self.open_connection()
-        
-        while not self.thread_exit.is_set():
-            if self.running:
-                try:
-                    self.read_data()
-                except Exception as e:
-                    self.log(f"Error in read loop: {e}")
-                    self.handle_connection_error()
-            else:
-                # If not running, check if we should attempt reconnection
-                if self.reconnect_attempts < self.max_reconnect_attempts and not self.thread_exit.is_set():
-                    time.sleep(self.reconnect_delay)
-                    self.reconnect_attempts += 1
-                    self.log(f"Attempting reconnection {self.reconnect_attempts}/{self.max_reconnect_attempts}")
-                    self.open_connection()
+        try:
+            self.open_connection()
+            
+            while self.thread_running:  # Using simple boolean flag
+                if not self.thread_running:
+                    break  # Double-check to ensure quick exit
+                    
+                if self.running:
+                    try:
+                        self.read_data()
+                    except Exception as e:
+                        self.log(f"Error in read loop: {e}")
+                        self.handle_connection_error()
                 else:
-                    # Sleep to avoid CPU spinning, but check exit flag frequently
-                    self.thread_exit.wait(1)
+                    # If not running and not a forced disconnect, check if we should attempt reconnection
+                    if not self.forced_disconnect and self.reconnect_attempts < self.max_reconnect_attempts and self.thread_running:
+                        time.sleep(0.1)  # Shorter sleep to check thread_running more frequently
+                        if not self.thread_running:
+                            break  # Check again after sleep
+                            
+                        self.reconnect_attempts += 1
+                        self.log(f"Attempting reconnection {self.reconnect_attempts}/{self.max_reconnect_attempts}")
+                        self.open_connection()
+                    else:
+                        # Sleep to avoid CPU spinning, but in smaller chunks with exit checks
+                        for _ in range(10):  # 10 × 0.01s = 0.1s total
+                            if not self.thread_running:
+                                break
+                            time.sleep(0.01)
+            
+            self.log(f"Thread for {self.port} is exiting normally")
+        except Exception as e:
+            self.log(f"Thread for {self.port} exiting due to exception: {e}")
+            
+            # Update device connection status if exception occurred
+            if self.device_name != "NULL" and self.device:
+                if self.device.get("connection_status", None) != ConnectionStatus.NOT_CONNECTED:
+                    self.log(f"Updating connection status for {self.device_name} to NOT_CONNECTED due to exception")
+                    self.device["connection_status"] = ConnectionStatus.NOT_CONNECTED
+        finally:
+            # Ensure connection is closed when thread exits
+            if self.serial_connection and self.serial_connection.is_open:
+                try:
+                    self.serial_connection.close()
+                    self.log(f"Closed serial connection to {self.port} on thread exit")
+                except:
+                    pass
+            self.log(f"Thread for {self.port} has exited")
 
     def open_connection(self):
         """Open the serial connection."""
@@ -110,6 +129,7 @@ class SerialMessageHandler:
             self.log(f"Connected to {self.port} at {self.baudrate} baud.")
             time.sleep(0.5)  # Short delay for connection to stabilize
             self.running = True
+            self.forced_disconnect = False  # Reset forced disconnect flag on successful connection
             self.reconnect_attempts = 0  # Reset reconnection counter on successful connection
         except serial.SerialException as e:
             self.log(f"Error opening serial port {self.port}: {e}")
@@ -124,20 +144,91 @@ class SerialMessageHandler:
                 self.log(f"Error closing connection: {e}")
         
         self.running = False
-        # We'll attempt reconnection in the run loop
+        
+        # Update device connection status if handler is associated with a device
+        # and it's not already marked as disconnected
+        if self.device_name != "NULL" and self.device and not self.forced_disconnect:
+            if self.device.get("connection_status", None) != ConnectionStatus.NOT_CONNECTED:
+                self.log(f"Connection error: updating status for {self.device_name} to NOT_CONNECTED")
+                self.device["connection_status"] = ConnectionStatus.NOT_CONNECTED
 
     def close_connection(self):
-        """Close the serial connection."""
+        """Close the serial connection and terminate the thread."""
+        self.log(f"Closing connection to {self.port}")
+        
+        # Update device connection status when closing connection
+        if self.device_name != "NULL" and self.device:
+            if self.device.get("connection_status", None) != ConnectionStatus.NOT_CONNECTED:
+                self.log(f"Updating connection status for {self.device_name} to NOT_CONNECTED during close")
+                self.device["connection_status"] = ConnectionStatus.NOT_CONNECTED
+        
+        # Use the dedicated thread stopping method
+        success = self.stop_thread(timeout=3.0)
+        
+        if not success:
+            self.log(f"Warning: Thread for {self.port} may still be running")
+
+    def stop_thread(self, timeout=3.0):
+        """
+        Stop the background thread explicitly.
+        
+        Args:
+            timeout: Maximum time to wait for the thread to terminate (seconds)
+            
+        Returns:
+            bool: True if thread terminated successfully, False if it timed out
+        """
+        self.log(f"Stopping thread for {self.port}...")
+        
+        # Update device connection status if this handler is associated with a device
+        if self.device_name != "NULL" and self.device:
+            # Using self.device reference instead of direct io_devices access
+            if self.device.get("connection_status", None) != ConnectionStatus.NOT_CONNECTED:
+                self.log(f"Updating connection status for {self.device_name} to NOT_CONNECTED")
+                self.device["connection_status"] = ConnectionStatus.NOT_CONNECTED
+        
+        # Signal the thread to stop
+        self.thread_running = False
+        self.forced_disconnect = True
         self.running = False
+        
+        # Give the thread a moment to notice the signal
+        time.sleep(0.1)
+        
+        # Close the serial connection if open
         if self.serial_connection and self.serial_connection.is_open:
             try:
                 self.serial_connection.close()
-                self.log(f"Serial connection to {self.port} closed.")
+                self.log(f"Closed serial connection to {self.port}")
             except Exception as e:
                 self.log(f"Error closing serial port: {e}")
+        
+        # Join the thread if it's still alive and we're not in the thread
+        if self.thread and self.thread.is_alive() and threading.current_thread() != self.thread:
+            self.log(f"Waiting for thread to terminate (timeout: {timeout}s)...")
+            
+            # Try joining the thread with the specified timeout
+            start_time = time.time()
+            while self.thread.is_alive() and (time.time() - start_time < timeout):
+                self.thread.join(timeout=0.5)
+                if self.thread.is_alive():
+                    self.log(f"Still waiting for thread to terminate...")
+            
+            # Return success based on whether the thread terminated
+            if self.thread.is_alive():
+                self.log(f"Warning: Thread for {self.port} did not terminate within {timeout}s")
+                return False
+            else:
+                self.log(f"Thread for {self.port} terminated successfully")
+                return True
+                
+        return not self.thread.is_alive()
 
     def read_data(self):
         """Read data from the serial port."""
+        if not self.thread_running:
+            return  # Exit immediately if thread should stop
+            
         if self.serial_connection and self.serial_connection.is_open:
             try:
                 # Check if data is available
@@ -150,9 +241,19 @@ class SerialMessageHandler:
                     time.sleep(0.01)
             except serial.SerialException as e:
                 self.log(f"Serial exception: {e}")
+                # Update connection status on serial exception
+                if self.device_name != "NULL" and self.device:
+                    if self.device.get("connection_status", None) != ConnectionStatus.NOT_CONNECTED:
+                        self.log(f"Updating connection status for {self.device_name} to NOT_CONNECTED due to serial exception")
+                        self.device["connection_status"] = ConnectionStatus.NOT_CONNECTED
                 self.handle_connection_error()
             except Exception as e:
                 self.log(f"Error reading data: {e}")
+                # Update connection status on any exception
+                if self.device_name != "NULL" and self.device:
+                    if self.device.get("connection_status", None) != ConnectionStatus.NOT_CONNECTED:
+                        self.log(f"Updating connection status for {self.device_name} to NOT_CONNECTED due to error")
+                        self.device["connection_status"] = ConnectionStatus.NOT_CONNECTED
 
     def process_data(self, data):
         """Process the received byte data using state machine approach"""
@@ -195,13 +296,6 @@ class SerialMessageHandler:
         """Validate checksum and process message if valid"""
         length = self.buffer[1]
         
-        # Ensure we have at least the minimum message length
-        # Minimum is: start(1) + length(1) + command(1) + checksum(1) = 4 bytes
-        # Note: We now allow for an empty payload
-        if length < 4:
-            self.log("Message too short")
-            return
-            
         # Validate checksum
         received_checksum = self.buffer[length - 1]
         calculated_checksum = self.calculate_checksum(self.buffer[:length - 1])
@@ -257,6 +351,13 @@ class SerialMessageHandler:
         """Send formatted message to the serial port."""
         if not self.serial_connection or not self.serial_connection.is_open:
             self.log("Cannot send data - serial connection not open")
+            
+            # Update connection status if connection is closed
+            if self.device_name != "NULL" and self.device:
+                if self.device.get("connection_status", None) != ConnectionStatus.NOT_CONNECTED:
+                    self.log(f"Updating connection status for {self.device_name} to NOT_CONNECTED - connection closed")
+                    self.device["connection_status"] = ConnectionStatus.NOT_CONNECTED
+            
             return False
             
         try:
@@ -266,6 +367,13 @@ class SerialMessageHandler:
             return True
         except Exception as e:
             self.log(f"Error sending data: {e}")
+            
+            # Update connection status on send error
+            if self.device_name != "NULL" and self.device:
+                if self.device.get("connection_status", None) != ConnectionStatus.NOT_CONNECTED:
+                    self.log(f"Updating connection status for {self.device_name} to NOT_CONNECTED due to send error")
+                    self.device["connection_status"] = ConnectionStatus.NOT_CONNECTED
+                    
             self.handle_connection_error()
             return False
     
@@ -273,6 +381,13 @@ class SerialMessageHandler:
         """Send raw data to the serial port without formatting."""
         if not self.serial_connection or not self.serial_connection.is_open:
             self.log("Cannot send raw data - serial connection not open")
+            
+            # Update connection status if connection is closed
+            if self.device_name != "NULL" and self.device:
+                if self.device.get("connection_status", None) != ConnectionStatus.NOT_CONNECTED:
+                    self.log(f"Updating connection status for {self.device_name} to NOT_CONNECTED - connection closed")
+                    self.device["connection_status"] = ConnectionStatus.NOT_CONNECTED
+                    
             return False
             
         try:
@@ -281,6 +396,13 @@ class SerialMessageHandler:
             return True
         except Exception as e:
             self.log(f"Error sending raw data: {e}")
+            
+            # Update connection status on send error
+            if self.device_name != "NULL" and self.device:
+                if self.device.get("connection_status", None) != ConnectionStatus.NOT_CONNECTED:
+                    self.log(f"Updating connection status for {self.device_name} to NOT_CONNECTED due to send error")
+                    self.device["connection_status"] = ConnectionStatus.NOT_CONNECTED
+                    
             self.handle_connection_error()
             return False
     
@@ -320,252 +442,3 @@ class SerialMessageHandler:
         self.device_name = device_name
         self.device = device_info
         self.log(f"Associated with device: {device_name}")
-
-
-# Handshake command handler
-def send_handshake_response(handler, payload):
-    """
-    Process handshake responses from devices according to the protocol:
-    1. PC sends 0xFF with payload 0x00
-    2. Arduino responds with 0xFF and its device ID
-    3. PC responds with 0xFF and echoes back the device ID it received
-    4. Arduino responds with 0xFF and payload 0xAA for success or 0xFF for failure
-    """
-    handler.log(f"Processing handshake response with payload: {[hex(b) for b in payload]}")
-    
-    if len(payload) < 1:
-        handler.log("Invalid handshake payload length")
-        return
-        
-    received_value = payload[0]
-    handler.log(f"Received value: {hex(received_value)}")
-    
-    # Phase 2: Arduino responded with its device ID
-    if received_value in [device_info["id"] for device_name, device_info in io_devices.items()]:
-        # Find which device this ID belongs to
-        for device_name, device_info in io_devices.items():
-            if received_value == device_info["id"]:
-                handler.log(f"Identified device: {device_name} with ID: {hex(received_value)}")
-                
-                # Update device status to in-progress
-                device_info["connection_status"] = ConnectionStatus.IN_PROGRESS
-                device_info["port_number"] = handler.port
-                device_info["thread"] = handler.thread
-                device_info["handler"] = handler
-                
-                # Associate this handler with the device
-                handler.set_device(device_name, device_info)
-                
-                # Phase 3: Echo back the device ID using Command.py
-                handler.log(f"Sending back device ID: {hex(received_value)}")
-                Command.send_handshake(bytes([received_value]), handler)
-                return
-    
-    # Phase 4: Arduino responded with success/failure
-    elif received_value == 0xAA:
-        # Success confirmation
-        handler.log("Received successful handshake confirmation (0xAA)")
-        if handler.device_name != "NULL":
-            device_info = io_devices[handler.device_name]
-            if device_info["connection_status"] == ConnectionStatus.IN_PROGRESS:
-                device_info["connection_status"] = ConnectionStatus.CONNECTED
-                handler.log(f"Handshake complete for {handler.device_name}!")
-                return
-            else:
-                handler.log(f"Device {handler.device_name} not in progress state (state: {device_info['connection_status']})")
-        else:
-            handler.log("Received handshake confirmation but no device is associated with this handler")
-    
-    elif received_value == 0xFF:
-        # Error confirmation
-        handler.log("Received error handshake response (0xFF)")
-        if handler.device_name != "NULL":
-            device_info = io_devices[handler.device_name]
-            if device_info["connection_status"] == ConnectionStatus.IN_PROGRESS:
-                device_info["connection_status"] = ConnectionStatus.NOT_CONNECTED
-                handler.log(f"Handshake failed for {handler.device_name}!")
-                return
-    
-    handler.log(f"Unhandled handshake response: {hex(received_value)}")
-    handler.log(f"Current handler device: {handler.device_name}")
-    for device_name, device_info in io_devices.items():
-        handler.log(f"Device {device_name}: ID={hex(device_info['id'])}, Status={device_info['connection_status']}, Port={device_info['port_number']}")
-
-
-def discover_devices(timeout=30):
-    """
-    Scan all available COM ports to discover connected devices
-    Returns a dictionary of discovered devices
-    """
-    print("Starting device discovery...")
-    
-    # Keep track of all created handlers for clean exit
-    handlers = []
-    
-    # Reset device statuses
-    for device in io_devices:
-        io_devices[device]["connection_status"] = ConnectionStatus.NOT_CONNECTED
-        io_devices[device]["port_number"] = "NULL"
-        io_devices[device]["handler"] = None
-        io_devices[device]["thread"] = None
-    
-    # Get list of available COM ports
-    ports = serial.tools.list_ports.comports()
-    if not ports:
-        print("No COM ports found")
-        return {}
-        
-    print(f"Found {len(ports)} COM ports")
-    
-    # Create handlers for each port
-    for port in ports:
-        print(f"Checking {port.device}...")
-        handler = SerialMessageHandler(port.device, 115200, debug=True)
-        handler.register_command(bytes([0xFF]), send_handshake_response)
-        handlers.append(handler)
-    
-    try:
-        # Send handshake requests to all ports
-        start_time = time.time()
-        handshake_command_id = bytes([0xFF])
-        
-        while time.time() - start_time < timeout:
-            # Check if all devices are connected
-            all_connected = True
-            for device_name, device_info in io_devices.items():
-                if device_info["connection_status"] != ConnectionStatus.CONNECTED:
-                    all_connected = False
-                    break
-                    
-            if all_connected:
-                print("All devices connected!")
-                break
-                
-            # Send handshake requests to all handlers
-            for handler in handlers:
-                # Skip handlers that are already associated with a connected device
-                if handler.device_name != "NULL" and io_devices[handler.device_name]["connection_status"] == ConnectionStatus.CONNECTED:
-                    continue
-                    
-                # Send initial handshake request with 0x00 payload
-                handler.send_data(handshake_command_id, bytes([0x00]))
-            
-            # Wait before next attempt
-            time.sleep(1)
-            
-        # Print discovery results
-        print("\nDevice Discovery Results:")
-        for device_name, device_info in io_devices.items():
-            status = device_info["connection_status"].name
-            port = device_info["port_number"] if status != "NOT_CONNECTED" else "N/A"
-            print(f"{device_name}: {status} on {port}")
-        
-        # Close handlers for devices that weren't connected
-        for handler in handlers:
-            if handler.device_name == "NULL":
-                handler.close_connection()
-                handlers.remove(handler)
-        
-        return {name: info for name, info in io_devices.items() 
-                if info["connection_status"] == ConnectionStatus.CONNECTED}
-                
-    except Exception as e:
-        print(f"Error during device discovery: {e}")
-        # Clean up on error
-        for handler in handlers:
-            try:
-                handler.close_connection()
-            except:
-                pass
-        return {}
-            
-        # Print discovery results
-        print("\nDevice Discovery Results:")
-        for device_name, device_info in io_devices.items():
-            status = device_info["connection_status"].name
-            port = device_info["port_number"] if status != "NOT_CONNECTED" else "N/A"
-            print(f"{device_name}: {status} on {port}")
-        
-        # Close handlers for devices that weren't connected
-        for handler in handlers:
-            if handler.device_name == "NULL":
-                handler.close_connection()
-                handlers.remove(handler)
-        
-        return {name: info for name, info in io_devices.items() 
-                if info["connection_status"] == ConnectionStatus.CONNECTED}
-                
-    except Exception as e:
-        print(f"Error during device discovery: {e}")
-        # Clean up on error
-        for handler in handlers:
-            try:
-                handler.close_connection()
-            except:
-                pass
-        return {}
-    
-    # Print discovery results
-    print("\nDevice Discovery Results:")
-    for device_name, device_info in io_devices.items():
-        status = device_info["connection_status"].name
-        port = device_info["port_number"] if status != "NOT_CONNECTED" else "N/A"
-        print(f"{device_name}: {status} on {port}")
-    
-    # Close handlers for devices that weren't connected
-    for handler in handlers:
-        if handler.device_name == "NULL":
-            handler.close_connection()
-    
-    return {name: info for name, info in io_devices.items() 
-            if info["connection_status"] == ConnectionStatus.CONNECTED}
-
-
-if __name__ == "__main__":
-    print("Serial Message Handler")
-    print("=====================")
-    
-    # Keep track of all handlers for clean exit
-    all_handlers = []
-    
-    try:
-        # Discover all devices
-        connected_devices = discover_devices(timeout=15)
-        
-        if not connected_devices:
-            print("No devices discovered")
-        else:
-            print(f"Discovered {len(connected_devices)} devices")
-            
-            # Keep the program running until interrupted
-            print("Press Ctrl+C to exit...")
-            while True:
-                time.sleep(1)
-                
-    except KeyboardInterrupt:
-        print("\nShutting down...")
-        
-    finally:
-        print("Closing all connections...")
-        # Close all device handlers
-        for device_name, device_info in io_devices.items():
-            if device_info["handler"]:
-                try:
-                    print(f"Closing connection to {device_name}...")
-                    device_info["handler"].close_connection()
-                except Exception as e:
-                    print(f"Error closing {device_name} connection: {e}")
-        
-        # Join any remaining threads to ensure clean exit
-        for device_name, device_info in io_devices.items():
-            if device_info["thread"] and device_info["thread"].is_alive():
-                try:
-                    print(f"Waiting for {device_name} thread to terminate...")
-                    device_info["thread"].join(timeout=2.0)
-                    if device_info["thread"].is_alive():
-                        print(f"Warning: Thread for {device_name} did not terminate gracefully")
-                except Exception as e:
-                    print(f"Error joining thread for {device_name}: {e}")
-        
-        print(f"Final status: {io_devices}")
-        print("Done!")
